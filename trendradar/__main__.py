@@ -25,6 +25,8 @@ from trendradar.core import load_config, parse_multi_account_config, validate_pa
 from trendradar.core.analyzer import convert_keyword_stats_to_platform_stats
 from trendradar.crawler import DataFetcher
 from trendradar.storage import convert_crawl_results_to_news_data
+from trendradar.storage.base import RSSData, RSSItem
+from trendradar.output.feishu_bitable import FeishuBitableWriter
 from trendradar.utils.time import DEFAULT_TIMEZONE, is_within_days, calculate_days_old
 from trendradar.ai import AIAnalyzer, AIAnalysisResult
 from trendradar.core.scheduler import ResolvedSchedule
@@ -1774,6 +1776,11 @@ class NewsAnalyzer:
                 raw_rss_items=raw_rss_items, rss_new_urls=rss_new_urls
             )
 
+            # 写入飞书多维表格（情报仓库 · 芯朋微舆情）
+            self._write_to_feishu_bitable(
+                results, id_to_name, failed_ids, raw_rss_items
+            )
+
         except Exception as e:
             print(f"分析流程执行出错: {e}")
             if self.ctx.config.get("DEBUG", False):
@@ -1781,6 +1788,79 @@ class NewsAnalyzer:
         finally:
             # 清理资源（包括过期数据清理和数据库连接关闭）
             self.ctx.cleanup()
+
+    def _write_to_feishu_bitable(
+        self,
+        results: Dict,
+        id_to_name: Dict,
+        failed_ids: List,
+        raw_rss_items: Optional[List[Dict]] = None,
+    ) -> None:
+        """
+        将爬取结果写入飞书多维表格「情报仓库 · 芯朋微舆情」
+
+        仅在配置了 FEISHU_APP_ID / FEISHU_APP_SECRET 时生效。
+        """
+        app_id = os.environ.get("FEISHU_APP_ID", "")
+        app_secret = os.environ.get("FEISHU_APP_SECRET", "")
+        if not app_id or not app_secret:
+            print("[Bitable] 未配置 FEISHU_APP_ID/APP_SECRET，跳过飞书写入")
+            return
+
+        try:
+            writer = FeishuBitableWriter(
+                app_id=app_id,
+                app_secret=app_secret,
+            )
+
+            # 转换热榜数据
+            crawl_time = self.ctx.format_time()
+            crawl_date = self.ctx.format_date()
+            news_data = None
+            if results:
+                news_data = convert_crawl_results_to_news_data(
+                    results, id_to_name, failed_ids, crawl_time, crawl_date
+                )
+
+            # 转换 RSS 数据
+            rss_data = None
+            if raw_rss_items:
+                from collections import defaultdict
+                rss_items_dict = defaultdict(list)
+                feed_id_to_name = {}
+                for item in raw_rss_items:
+                    feed_id = item.get("feed_id", "unknown")
+                    feed_name = item.get("feed_name", feed_id)
+                    rss_item = RSSItem(
+                        title=item.get("title", ""),
+                        feed_id=feed_id,
+                        feed_name=feed_name,
+                        url=item.get("url", ""),
+                        published_at=item.get("published_at", ""),
+                        summary=item.get("summary", ""),
+                        author=item.get("author", ""),
+                        crawl_time=crawl_time,
+                    )
+                    rss_items_dict[feed_id].append(rss_item)
+                    feed_id_to_name[feed_id] = feed_name
+
+                rss_data = RSSData(
+                    date=crawl_date,
+                    crawl_time=crawl_time,
+                    items=dict(rss_items_dict),
+                    id_to_name=feed_id_to_name,
+                )
+
+            # 写入多维表格
+            if news_data or rss_data:
+                total = writer.write_all(news_data, rss_data)
+                print(f"[Bitable] 共写入 {total} 条记录到情报仓库")
+            else:
+                print("[Bitable] 无数据可写入")
+
+        except Exception as e:
+            print(f"[Bitable] 飞书多维表格写入失败: {e}")
+            # 不阻断主流程
 
 
 def _record_doctor_result(results: List[Tuple[str, str, str]], status: str, item: str, detail: str) -> None:
